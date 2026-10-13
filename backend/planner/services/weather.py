@@ -1,6 +1,5 @@
-"""Retrieve hourly weather forecasts from Open-Meteo."""
-
 import logging
+import time
 
 import requests
 
@@ -9,6 +8,8 @@ logger = logging.getLogger(__name__)
 
 OPEN_METEO_API_URL = "https://api.open-meteo.com/v1/forecast"
 REQUEST_TIMEOUT_SECONDS = 15
+RATE_LIMIT_RETRY_DELAY_SECONDS = 2
+MAX_RATE_LIMIT_RETRIES = 1
 
 
 class WeatherServiceError(Exception):
@@ -60,50 +61,80 @@ def get_weather_forecasts(
         "timezone": "UTC",
     }
 
-    try:
-        response = requests.get(
-            OPEN_METEO_API_URL,
-            params=params,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-    except requests.Timeout as exc:
-        logger.warning(
-            "Open-Meteo request timed out: %s",
-            type(exc).__name__,
-        )
-        raise WeatherServiceError(
-            "The weather request timed out."
-        ) from exc
-
-    except requests.RequestException as exc:
-        response = getattr(exc, "response", None)
-
-        if response is not None:
-            logger.warning(
-                "Open-Meteo returned HTTP %s.",
-                response.status_code,
+    # Retry once if Open-Meteo rate-limits this request.
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        try:
+            response = requests.get(
+                OPEN_METEO_API_URL,
+                params=params,
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
-        else:
+
+            if (
+                response.status_code == 429
+                and attempt < MAX_RATE_LIMIT_RETRIES
+            ):
+                logger.warning(
+                    "Open-Meteo returned HTTP 429. "
+                    "Retrying once after a short delay."
+                )
+                response.close()
+                time.sleep(RATE_LIMIT_RETRY_DELAY_SECONDS)
+                continue
+
+            response.raise_for_status()
+            data = response.json()
+            break
+
+        except requests.Timeout as exc:
             logger.warning(
-                "Open-Meteo connection failed: %s",
+                "Open-Meteo request timed out: %s",
                 type(exc).__name__,
             )
+            raise WeatherServiceError(
+                "The weather request timed out."
+            ) from exc
 
+        except requests.RequestException as exc:
+            error_response = getattr(exc, "response", None)
+
+            if error_response is not None:
+                logger.warning(
+                    "Open-Meteo returned HTTP %s.",
+                    error_response.status_code,
+                )
+            else:
+                logger.warning(
+                    "Open-Meteo connection failed: %s",
+                    type(exc).__name__,
+                )
+
+            if (
+                error_response is not None
+                and error_response.status_code == 429
+            ):
+                raise WeatherServiceError(
+                    "Open-Meteo rate limit reached. "
+                    "Please try again later."
+                ) from exc
+
+            raise WeatherServiceError(
+                "Unable to retrieve weather data."
+            ) from exc
+
+        except ValueError as exc:
+            logger.warning(
+                "Open-Meteo returned invalid JSON: %s",
+                type(exc).__name__,
+            )
+            raise WeatherServiceError(
+                "The weather provider returned invalid JSON."
+            ) from exc
+
+    else:
         raise WeatherServiceError(
             "Unable to retrieve weather data."
-        ) from exc
-
-    except ValueError as exc:
-        logger.warning(
-            "Open-Meteo returned invalid JSON: %s",
-            type(exc).__name__,
         )
-        raise WeatherServiceError(
-            "The weather provider returned invalid JSON."
-        ) from exc
 
     # A single location returns an object.
     # Multiple locations return a list of forecast objects.
