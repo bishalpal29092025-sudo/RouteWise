@@ -65,14 +65,12 @@ def get_weather_forecasts(
             latitude = float(latitude)
             longitude = float(longitude)
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "Coordinates must be numeric."
-            ) from exc
+            raise ValueError("Coordinates must be numeric.") from exc
 
-        if not (-90 <= latitude <= 90):
+        if not -90 <= latitude <= 90:
             raise ValueError("Latitude must be between -90 and 90.")
 
-        if not (-180 <= longitude <= 180):
+        if not -180 <= longitude <= 180:
             raise ValueError("Longitude must be between -180 and 180.")
 
         normalized_locations.append((latitude, longitude))
@@ -91,7 +89,7 @@ def get_weather_forecasts(
         "timezone": "UTC",
     }
 
-    # Create a stable cache key for identical forecast requests.
+    # Generate a stable key for identical forecast requests.
     cache_payload = json.dumps(
         {
             "locations": [
@@ -113,8 +111,7 @@ def get_weather_forecasts(
 
     cache_key = f"weather_forecast:{cache_hash}"
 
-    # A cache failure should not prevent us from attempting the
-    # weather request.
+    # Cache problems must not prevent a fresh weather request.
     try:
         cached_results = cache.get(cache_key)
     except Exception:
@@ -127,7 +124,7 @@ def get_weather_forecasts(
         logger.info("Using cached Open-Meteo forecast.")
         return cached_results
 
-    # Request the forecast, retrying once after an HTTP 429.
+    # Request weather and retry once if the provider rate-limits us.
     data = None
 
     for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
@@ -139,6 +136,13 @@ def get_weather_forecasts(
             )
 
             if response.status_code == 429:
+                # Log the provider response to help diagnose the limit.
+                # Truncate it to avoid excessively large log entries.
+                logger.warning(
+                    "Open-Meteo HTTP 429 response details: %s",
+                    response.text[:500],
+                )
+
                 if attempt < MAX_RATE_LIMIT_RETRIES:
                     logger.warning(
                         "Open-Meteo returned HTTP 429. "
@@ -162,7 +166,7 @@ def get_weather_forecasts(
 
             try:
                 data = response.json()
-            except (ValueError, requests.exceptions.JSONDecodeError) as exc:
+            except ValueError as exc:
                 logger.warning("Open-Meteo returned invalid JSON.")
                 raise WeatherServiceError(
                     "The weather provider returned invalid JSON."
@@ -200,16 +204,17 @@ def get_weather_forecasts(
             ) from exc
 
     if data is None:
-        raise WeatherServiceError(
-            "Unable to retrieve weather data."
-        )
+        raise WeatherServiceError("Unable to retrieve weather data.")
 
     # Open-Meteo returns an object for one location and a list
     # for multiple locations.
     if len(normalized_locations) == 1 and isinstance(data, dict):
         data = [data]
 
-    if not isinstance(data, list) or len(data) != len(normalized_locations):
+    if (
+        not isinstance(data, list)
+        or len(data) != len(normalized_locations)
+    ):
         logger.warning(
             "Open-Meteo returned an unexpected response format."
         )
@@ -242,8 +247,8 @@ def get_weather_forecasts(
             }
         )
 
-    # Cache only validated, successful forecasts.
-    # If caching fails, still return the successful provider response.
+    # Cache only validated, successful responses.
+    # A cache write failure should not discard fresh weather data.
     try:
         cache.set(
             cache_key,
