@@ -18,7 +18,7 @@ METERS_PER_MILE = 1609.344
 MILLISECONDS_PER_SECOND = 1000
 
 # Keep requests reasonably small for URL length and response handling.
-WEATHER_BATCH_SIZE = 20
+WEATHER_BATCH_SIZE = 50
 MAX_FORECAST_DAYS = 16
 
 
