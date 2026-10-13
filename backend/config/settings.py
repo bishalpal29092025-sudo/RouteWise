@@ -4,24 +4,51 @@ Django settings for config project.
 
 Weather-Aware Truck Routing — RouteWise
 """
+
 import os
 from pathlib import Path
 
+import dj_database_url
 from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Load environment variables from backend/.env for local development.
 load_dotenv(BASE_DIR / ".env")
 
+
+# --------------------------------------------------
 # Security settings
-# Development settings only. Use environment variables in production.
-SECRET_KEY = "django-insecure-vc1buyq_5dubqs+7i#%b++hpvg1yaz5b47uv5qw!vy0-hp#at9"
-DEBUG = True
-ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
+# --------------------------------------------------
+
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
+
+if not SECRET_KEY:
+    raise ValueError(
+        "DJANGO_SECRET_KEY is missing from the environment."
+    )
+
+DEBUG = os.getenv("DJANGO_DEBUG", "True").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv(
+        "DJANGO_ALLOWED_HOSTS",
+        "localhost,127.0.0.1",
+    ).split(",")
+    if host.strip()
+]
 
 
+# --------------------------------------------------
 # Application definition
+# --------------------------------------------------
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -39,9 +66,13 @@ INSTALLED_APPS = [
 ]
 
 
+# --------------------------------------------------
 # Middleware
+# --------------------------------------------------
+
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -55,7 +86,10 @@ MIDDLEWARE = [
 ROOT_URLCONF = "config.urls"
 
 
+# --------------------------------------------------
 # Templates
+# --------------------------------------------------
+
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
@@ -75,17 +109,35 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 
 
+# --------------------------------------------------
 # Database
-# SQLite is sufficient for the current development stage.
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+# --------------------------------------------------
+# Use PostgreSQL when DATABASE_URL is configured.
+# Otherwise, use SQLite for local development.
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if DATABASE_URL:
+    DATABASES = {
+        "default": dj_database_url.parse(
+            DATABASE_URL,
+            conn_max_age=600,
+            ssl_require=not DEBUG,
+        )
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
+    }
 
 
+# --------------------------------------------------
 # Password validation
+# --------------------------------------------------
+
 AUTH_PASSWORD_VALIDATORS = [
     {
         "NAME": (
@@ -114,23 +166,48 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 
+# --------------------------------------------------
 # Internationalization
+# --------------------------------------------------
+
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
+
 USE_I18N = True
 USE_TZ = True
 
 
+# --------------------------------------------------
 # Static files
+# --------------------------------------------------
+
 STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": (
+            "whitenoise.storage.CompressedManifestStaticFilesStorage"
+        ),
+    },
+}
 
 
+# --------------------------------------------------
 # Email
+# --------------------------------------------------
+
 # Emails are printed in the terminal during development.
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 
 
+# --------------------------------------------------
 # Django REST Framework
+# --------------------------------------------------
+
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": [
         "rest_framework.renderers.JSONRenderer",
@@ -139,13 +216,25 @@ REST_FRAMEWORK = {
 }
 
 
+# --------------------------------------------------
 # CORS
-# Allow the local Vite frontend to call the Django API.
+# --------------------------------------------------
+# Local development origins are allowed by default.
+# Set CORS_ALLOWED_ORIGINS on Render after deploying
+# the frontend to Vercel.
+
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
 ]
 
 
+# --------------------------------------------------
 # Default primary key field type
+# --------------------------------------------------
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
