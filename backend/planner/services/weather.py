@@ -1,15 +1,23 @@
+
+"""Retrieve and cache hourly weather forecasts from Open-Meteo."""
+
+import hashlib
+import json
 import logging
 import time
 
 import requests
+from django.core.cache import cache
 
 
 logger = logging.getLogger(__name__)
 
 OPEN_METEO_API_URL = "https://api.open-meteo.com/v1/forecast"
+
 REQUEST_TIMEOUT_SECONDS = 15
 RATE_LIMIT_RETRY_DELAY_SECONDS = 2
 MAX_RATE_LIMIT_RETRIES = 1
+WEATHER_CACHE_TTL_SECONDS = 600  # 10 minutes
 
 
 class WeatherServiceError(Exception):
@@ -23,16 +31,19 @@ def get_weather_forecasts(
     """
     Retrieve hourly forecasts for multiple locations.
 
+    Successful responses are cached for 10 minutes to reduce
+    repeated requests to Open-Meteo.
+
     Args:
         locations: List of (latitude, longitude) pairs.
         forecast_days: Number of forecast days, from 1 to 16.
 
     Returns:
-        A list of forecast dictionaries in the same order as locations.
+        Forecast dictionaries in the same order as locations.
 
     Raises:
-        ValueError: If the input locations or forecast days are invalid.
-        WeatherServiceError: If the weather provider request fails.
+        ValueError: If inputs are invalid.
+        WeatherServiceError: If weather data cannot be retrieved.
     """
     if not locations:
         raise ValueError("At least one location is required.")
@@ -40,19 +51,38 @@ def get_weather_forecasts(
     if not 1 <= forecast_days <= 16:
         raise ValueError("forecast_days must be between 1 and 16.")
 
-    for latitude, longitude in locations:
-        if not -90 <= latitude <= 90:
+    normalized_locations = []
+
+    for location in locations:
+        if not isinstance(location, (tuple, list)) or len(location) != 2:
+            raise ValueError(
+                "Each location must contain latitude and longitude."
+            )
+
+        latitude, longitude = location
+
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Coordinates must be numeric."
+            ) from exc
+
+        if not (-90 <= latitude <= 90):
             raise ValueError("Latitude must be between -90 and 90.")
 
-        if not -180 <= longitude <= 180:
+        if not (-180 <= longitude <= 180):
             raise ValueError("Longitude must be between -180 and 180.")
+
+        normalized_locations.append((latitude, longitude))
 
     params = {
         "latitude": ",".join(
-            str(latitude) for latitude, _ in locations
+            str(latitude) for latitude, _ in normalized_locations
         ),
         "longitude": ",".join(
-            str(longitude) for _, longitude in locations
+            str(longitude) for _, longitude in normalized_locations
         ),
         "hourly": "wind_speed_10m,precipitation,rain,snowfall",
         "wind_speed_unit": "mph",
@@ -61,7 +91,45 @@ def get_weather_forecasts(
         "timezone": "UTC",
     }
 
-    # Retry once if Open-Meteo rate-limits this request.
+    # Create a stable cache key for identical forecast requests.
+    cache_payload = json.dumps(
+        {
+            "locations": [
+                [round(latitude, 5), round(longitude, 5)]
+                for latitude, longitude in normalized_locations
+            ],
+            "forecast_days": forecast_days,
+            "hourly": params["hourly"],
+            "wind_speed_unit": params["wind_speed_unit"],
+            "precipitation_unit": params["precipitation_unit"],
+            "timezone": params["timezone"],
+        },
+        sort_keys=True,
+    )
+
+    cache_hash = hashlib.sha256(
+        cache_payload.encode("utf-8")
+    ).hexdigest()
+
+    cache_key = f"weather_forecast:{cache_hash}"
+
+    # A cache failure should not prevent us from attempting the
+    # weather request.
+    try:
+        cached_results = cache.get(cache_key)
+    except Exception:
+        logger.warning(
+            "Weather cache lookup failed; requesting fresh weather."
+        )
+        cached_results = None
+
+    if cached_results is not None:
+        logger.info("Using cached Open-Meteo forecast.")
+        return cached_results
+
+    # Request the forecast, retrying once after an HTTP 429.
+    data = None
+
     for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
         try:
             response = requests.get(
@@ -70,27 +138,45 @@ def get_weather_forecasts(
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
 
-            if (
-                response.status_code == 429
-                and attempt < MAX_RATE_LIMIT_RETRIES
-            ):
+            if response.status_code == 429:
+                if attempt < MAX_RATE_LIMIT_RETRIES:
+                    logger.warning(
+                        "Open-Meteo returned HTTP 429. "
+                        "Retrying once after a short delay."
+                    )
+                    response.close()
+                    time.sleep(RATE_LIMIT_RETRY_DELAY_SECONDS)
+                    continue
+
                 logger.warning(
-                    "Open-Meteo returned HTTP 429. "
-                    "Retrying once after a short delay."
+                    "Open-Meteo rate limit remains after retry."
                 )
                 response.close()
-                time.sleep(RATE_LIMIT_RETRY_DELAY_SECONDS)
-                continue
+
+                raise WeatherServiceError(
+                    "Open-Meteo rate limit reached. "
+                    "Please try again later."
+                )
 
             response.raise_for_status()
-            data = response.json()
+
+            try:
+                data = response.json()
+            except (ValueError, requests.exceptions.JSONDecodeError) as exc:
+                logger.warning("Open-Meteo returned invalid JSON.")
+                raise WeatherServiceError(
+                    "The weather provider returned invalid JSON."
+                ) from exc
+            finally:
+                response.close()
+
             break
 
+        except WeatherServiceError:
+            raise
+
         except requests.Timeout as exc:
-            logger.warning(
-                "Open-Meteo request timed out: %s",
-                type(exc).__name__,
-            )
+            logger.warning("Open-Meteo request timed out.")
             raise WeatherServiceError(
                 "The weather request timed out."
             ) from exc
@@ -109,39 +195,21 @@ def get_weather_forecasts(
                     type(exc).__name__,
                 )
 
-            if (
-                error_response is not None
-                and error_response.status_code == 429
-            ):
-                raise WeatherServiceError(
-                    "Open-Meteo rate limit reached. "
-                    "Please try again later."
-                ) from exc
-
             raise WeatherServiceError(
                 "Unable to retrieve weather data."
             ) from exc
 
-        except ValueError as exc:
-            logger.warning(
-                "Open-Meteo returned invalid JSON: %s",
-                type(exc).__name__,
-            )
-            raise WeatherServiceError(
-                "The weather provider returned invalid JSON."
-            ) from exc
-
-    else:
+    if data is None:
         raise WeatherServiceError(
             "Unable to retrieve weather data."
         )
 
-    # A single location returns an object.
-    # Multiple locations return a list of forecast objects.
-    if len(locations) == 1 and isinstance(data, dict):
+    # Open-Meteo returns an object for one location and a list
+    # for multiple locations.
+    if len(normalized_locations) == 1 and isinstance(data, dict):
         data = [data]
 
-    if not isinstance(data, list) or len(data) != len(locations):
+    if not isinstance(data, list) or len(data) != len(normalized_locations):
         logger.warning(
             "Open-Meteo returned an unexpected response format."
         )
@@ -172,6 +240,19 @@ def get_weather_forecasts(
                 "timezone": item.get("timezone"),
                 "hourly": hourly,
             }
+        )
+
+    # Cache only validated, successful forecasts.
+    # If caching fails, still return the successful provider response.
+    try:
+        cache.set(
+            cache_key,
+            results,
+            timeout=WEATHER_CACHE_TTL_SECONDS,
+        )
+    except Exception:
+        logger.warning(
+            "Weather cache write failed; returning fresh forecast."
         )
 
     return results
