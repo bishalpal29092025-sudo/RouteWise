@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+backend/.venv/
+
+# Node.js
+node_modules/
+dist/
+dist-ssr/
+.vite/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
