@@ -1,8 +1,11 @@
-
 """Retrieve hourly weather forecasts from Open-Meteo."""
+
+import logging
 
 import requests
 
+
+logger = logging.getLogger(__name__)
 
 OPEN_METEO_API_URL = "https://api.open-meteo.com/v1/forecast"
 REQUEST_TIMEOUT_SECONDS = 15
@@ -25,6 +28,10 @@ def get_weather_forecasts(
 
     Returns:
         A list of forecast dictionaries in the same order as locations.
+
+    Raises:
+        ValueError: If the input locations or forecast days are invalid.
+        WeatherServiceError: If the weather provider request fails.
     """
     if not locations:
         raise ValueError("At least one location is required.")
@@ -40,8 +47,12 @@ def get_weather_forecasts(
             raise ValueError("Longitude must be between -180 and 180.")
 
     params = {
-        "latitude": ",".join(str(lat) for lat, _ in locations),
-        "longitude": ",".join(str(lon) for _, lon in locations),
+        "latitude": ",".join(
+            str(latitude) for latitude, _ in locations
+        ),
+        "longitude": ",".join(
+            str(longitude) for _, longitude in locations
+        ),
         "hourly": "wind_speed_10m,precipitation,rain,snowfall",
         "wind_speed_unit": "mph",
         "precipitation_unit": "inch",
@@ -59,26 +70,50 @@ def get_weather_forecasts(
         data = response.json()
 
     except requests.Timeout as exc:
+        logger.warning(
+            "Open-Meteo request timed out: %s",
+            type(exc).__name__,
+        )
         raise WeatherServiceError(
             "The weather request timed out."
         ) from exc
 
     except requests.RequestException as exc:
+        response = getattr(exc, "response", None)
+
+        if response is not None:
+            logger.warning(
+                "Open-Meteo returned HTTP %s.",
+                response.status_code,
+            )
+        else:
+            logger.warning(
+                "Open-Meteo connection failed: %s",
+                type(exc).__name__,
+            )
+
         raise WeatherServiceError(
             "Unable to retrieve weather data."
         ) from exc
 
     except ValueError as exc:
+        logger.warning(
+            "Open-Meteo returned invalid JSON: %s",
+            type(exc).__name__,
+        )
         raise WeatherServiceError(
             "The weather provider returned invalid JSON."
         ) from exc
 
-    # A single location returns an object; multiple locations
-    # return a list of forecast objects.
+    # A single location returns an object.
+    # Multiple locations return a list of forecast objects.
     if len(locations) == 1 and isinstance(data, dict):
         data = [data]
 
     if not isinstance(data, list) or len(data) != len(locations):
+        logger.warning(
+            "Open-Meteo returned an unexpected response format."
+        )
         raise WeatherServiceError(
             "The provider returned an unexpected number of forecasts."
         )
@@ -86,20 +121,27 @@ def get_weather_forecasts(
     results = []
 
     for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise WeatherServiceError(
+                f"Invalid weather response for location {index}."
+            )
+
         hourly = item.get("hourly")
 
-        if not hourly or not hourly.get("time"):
+        if not isinstance(hourly, dict) or not hourly.get("time"):
             raise WeatherServiceError(
                 f"No hourly forecast was returned for location {index}."
             )
 
-        results.append({
-            "provider": "Open-Meteo",
-            "latitude": item.get("latitude"),
-            "longitude": item.get("longitude"),
-            "timezone": item.get("timezone"),
-            "hourly": hourly,
-        })
+        results.append(
+            {
+                "provider": "Open-Meteo",
+                "latitude": item.get("latitude"),
+                "longitude": item.get("longitude"),
+                "timezone": item.get("timezone"),
+                "hourly": hourly,
+            }
+        )
 
     return results
 
